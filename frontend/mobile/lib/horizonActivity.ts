@@ -234,6 +234,18 @@ function invocationToRecord(
 }
 
 /**
+ * One page of history and the token that asks Horizon for the page before it.
+ *
+ * `nextCursor` is the paging token of the oldest operation in the page, which
+ * is what `.cursor()` wants for the next (older) page in `desc` order. It is
+ * null when Horizon returned nothing at all — the history ends there.
+ */
+export type HorizonActivityPage = {
+  records: TxRecord[];
+  nextCursor: string | null;
+};
+
+/**
  * Map a Horizon OPERATIONS page into TxRecords.
  *
  * Operations rather than payments: Horizon's payments feed omits
@@ -245,23 +257,40 @@ function invocationToRecord(
  * `mine` is every address that counts as us (the fee-payer and, for a smart
  * wallet, the contract), so direction is judged against both.
  */
-async function loadClassicActivity(account: string, mine: Set<string>, limit: number): Promise<TxRecord[]> {
+async function loadClassicActivity(
+  account: string,
+  mine: Set<string>,
+  limit: number,
+  cursor?: string,
+): Promise<HorizonActivityPage> {
   const server = new Horizon.Server(getNetwork().horizonUrl);
   let records: Array<Record<string, unknown>>;
   try {
     // Over-fetch: many operation types (manage_data breadcrumbs, change_trust,
     // contract deploys) yield no feed row, so asking for exactly `limit` ops
     // would return far fewer than `limit` rows.
-    const page = await server
+    let operations = server
       .operations()
       .forAccount(account)
       .order('desc')
-      .limit(Math.min(200, Math.max(limit, limit * 4)))
-      .call();
+      .limit(Math.min(200, Math.max(limit, limit * 4)));
+    // Older pages are addressed by the paging token of the last operation the
+    // user has already seen. In `desc` order that asks for the operations
+    // immediately before it, so consecutive pages never overlap.
+    if (cursor) operations = operations.cursor(cursor);
+    const page = await operations.call();
     records = page.records as unknown as Array<Record<string, unknown>>;
-  } catch {
-    return [];
+  } catch (error) {
+    // A first load degrades to an empty feed. An explicitly requested older
+    // page must fail loudly instead: the screen keeps its rows and offers a
+    // retry, rather than pretending the history ends here.
+    if (cursor) throw error;
+    return { records: [], nextCursor: null };
   }
+
+  const oldest = records[records.length - 1];
+  const nextCursor =
+    oldest && oldest['paging_token'] ? String(oldest['paging_token']) : null;
 
   const out: TxRecord[] = [];
   for (const r of records) {
@@ -321,7 +350,57 @@ async function loadClassicActivity(account: string, mine: Set<string>, limit: nu
     }
     if (out.length >= limit) break;
   }
-  return out;
+  return { records: out, nextCursor };
+}
+
+/**
+ * Load one page of an account's activity. Without a cursor this is the first
+ * load: classic wallets read Horizon's operations feed directly, and contract
+ * wallets merge two sources IN PARALLEL — the fee-payer G-account's classic
+ * operations and the contract's SAC transfer events — so a slow event scan
+ * never delays the classic half.
+ *
+ * With a cursor it loads the OLDER page the token points at, from Horizon
+ * only. Soroban RPC events cannot be paged back beyond their short retention
+ * window, so older pages of a smart wallet's history are honestly whatever
+ * Horizon still has; the screen says so.
+ */
+export async function loadHorizonActivityPage(
+  address: string,
+  limit = 25,
+  cursor?: string,
+): Promise<HorizonActivityPage> {
+  if (!StrKey.isValidContract(address)) {
+    return loadClassicActivity(address, new Set([address]), limit, cursor);
+  }
+
+  const feePayer = await getFeePayerAddress();
+  const mine = new Set(feePayer ? [address, feePayer] : [address]);
+
+  if (cursor) {
+    // No fee payer means no Horizon feed to page through for this wallet.
+    if (!feePayer) return { records: [], nextCursor: null };
+    return loadClassicActivity(feePayer, mine, limit, cursor);
+  }
+
+  const [contractRecords, classic] = await Promise.all([
+    loadContractSacActivity([...mine], limit),
+    feePayer
+      ? loadClassicActivity(feePayer, mine, limit)
+      : Promise.resolve<HorizonActivityPage>({ records: [], nextCursor: null }),
+  ]);
+
+  if (contractRecords.length === 0) return classic;
+  // Merge classic + contract records, deduped by tx hash. Horizon is the
+  // richer source (a swap arrives as one 'swapped' row rather than a bare
+  // outgoing transfer), so where both describe the same transaction Horizon's
+  // version wins and the event-derived one is dropped.
+  const seen = new Set(classic.records.map((r) => r.hash).filter(Boolean));
+  const merged = [...classic.records, ...contractRecords.filter((r) => !r.hash || !seen.has(r.hash))];
+  return {
+    records: merged.sort((a, b) => b.timestamp - a.timestamp).slice(0, limit),
+    nextCursor: classic.nextCursor,
+  };
 }
 
 /**
@@ -331,23 +410,5 @@ async function loadClassicActivity(account: string, mine: Set<string>, limit: nu
  * events — so a slow event scan never delays the classic half.
  */
 export async function loadHorizonActivity(address: string, limit = 25): Promise<TxRecord[]> {
-  if (!StrKey.isValidContract(address)) {
-    return loadClassicActivity(address, new Set([address]), limit);
-  }
-
-  const feePayer = await getFeePayerAddress();
-  const mine = new Set(feePayer ? [address, feePayer] : [address]);
-  const [contractRecords, classic] = await Promise.all([
-    loadContractSacActivity([...mine], limit),
-    feePayer ? loadClassicActivity(feePayer, mine, limit) : Promise.resolve([]),
-  ]);
-
-  if (contractRecords.length === 0) return classic;
-  // Merge classic + contract records, deduped by tx hash. Horizon is the
-  // richer source (a swap arrives as one 'swapped' row rather than a bare
-  // outgoing transfer), so where both describe the same transaction Horizon's
-  // version wins and the event-derived one is dropped.
-  const seen = new Set(classic.map((r) => r.hash).filter(Boolean));
-  const merged = [...classic, ...contractRecords.filter((r) => !r.hash || !seen.has(r.hash))];
-  return merged.sort((a, b) => b.timestamp - a.timestamp).slice(0, limit);
+  return (await loadHorizonActivityPage(address, limit)).records;
 }
